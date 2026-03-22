@@ -347,7 +347,7 @@
     }
   }
 
-  function base64ToBytes  function base64ToBytes(b64) {
+  function base64ToBytes(b64) {
     const bin = atob(b64);
     const len = bin.length;
     const bytes = new Uint8Array(len);
