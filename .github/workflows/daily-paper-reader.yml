@@ -30,7 +30,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
+      GEMINI_SUMMARY_MODEL: ${{ secrets.GEMINI_SUMMARY_MODEL }}
+      GEMINI_REWRITE_MODEL: gemini-3-flash-preview
+      GEMINI_RERANK_MODEL: gemini-3-flash-preview
+      GEMINI_FILTER_MODEL: gemini-3-flash-preview
       BLT_API_KEY: ${{ secrets.BLT_API_KEY }}
+      BLT_API_BASE: ${{ secrets.Summarized_LLM_BASE_URL }}
+      BLT_SUMMARY_MODEL: ${{ secrets.Summarized_LLM_MODEL }}
       BLT_REWRITE_MODEL: gemini-3-flash-preview
       BLT_RERANK_MODEL: qwen3-reranker-4b
       BLT_FILTER_MODEL: gemini-3-flash-preview-nothinking

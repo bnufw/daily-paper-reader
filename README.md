@@ -96,11 +96,11 @@
 
 ### 1) 🔑 准备大模型 API Key
 
-当前 README 默认以 **柏拉图 API 平台** 为示例，建议先按默认配置跑通。
+当前 README 默认以 **Google 官方 Gemini API** 为示例，推荐先使用官方默认地址完成配置。
 
-- 🌐 打开 [柏拉图 API 平台](https://api.bltcy.ai/)
-- 📝 完成注册 / 登录
-- 🔐 充值并创建密钥
+- 🌐 打开 [Google AI Studio](https://aistudio.google.com/apikey)
+- 📝 创建 Gemini API Key
+- 🔧 默认 Base URL 为 `https://generativelanguage.googleapis.com/v1beta/openai`，也可以改成自建代理地址
 
 ### 2) 🪪 准备 GitHub PAT
 

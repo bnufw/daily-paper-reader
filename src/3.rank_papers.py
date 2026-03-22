@@ -1,14 +1,30 @@
 #!/usr/bin/env python
-# 使用柏拉图 Rerank API 对候选论文做重排序（简化版）。
+# 使用 Gemini 评分或兼容旧网关的 rerank 接口对候选论文做重排序。
 
 import argparse
 import json
 import os
 import random
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from llm import BltClient
+try:
+    from llm import GeminiClient, resolve_gemini_api_key, resolve_model_env
+except ImportError:
+    from llm import BltClient as GeminiClient  # type: ignore
+
+    def resolve_gemini_api_key() -> str:
+        return (
+            os.getenv("GEMINI_API_KEY")
+            or os.getenv("BLT_API_KEY")
+            or os.getenv("LLM_API_KEY")
+            or ""
+        )
+
+    def resolve_model_env(primary_name: str, legacy_name: str, default: str) -> str:
+        return os.getenv(primary_name) or os.getenv(legacy_name) or default
+
 
 SCRIPT_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -28,6 +44,174 @@ GLOBAL_POOL_GUARANTEED_MIN = 5
 GLOBAL_POOL_GUARANTEED_MAX = 20
 GLOBAL_POOL_RRF_MIN = 60
 GLOBAL_POOL_RRF_MAX = 300
+
+
+def strip_json_wrappers(text: str) -> str:
+  cleaned = str(text or '').strip()
+  cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
+  cleaned = re.sub(r'\s*```$', '', cleaned)
+  return cleaned.strip()
+
+
+def repair_json_suffix(text: str) -> str:
+  if not text:
+    return text
+  stack: List[str] = []
+  in_str = False
+  escaped = False
+  for ch in text:
+    if in_str:
+      if escaped:
+        escaped = False
+        continue
+      if ch == '\\':
+        escaped = True
+        continue
+      if ch == '"':
+        in_str = False
+      continue
+    if ch == '"':
+      in_str = True
+    elif ch == '{':
+      stack.append('}')
+    elif ch == '[':
+      stack.append(']')
+    elif ch in ('}', ']'):
+      if stack and stack[-1] == ch:
+        stack.pop()
+  repaired = text
+  if in_str:
+    repaired += '"'
+  if stack:
+    repaired += ''.join(reversed(stack))
+  repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
+  return repaired
+
+
+def parse_llm_json(content: str) -> Dict[str, Any] | List[Any] | None:
+  raw = strip_json_wrappers(content)
+  if not raw:
+    return None
+  candidates: List[str] = []
+  decoder = json.JSONDecoder()
+  start = raw.find('{')
+  end = raw.rfind('}')
+  if start != -1:
+    candidates.append(raw[start:])
+    if end != -1 and end > start:
+      candidates.append(raw[start:end + 1])
+  else:
+    candidates.append(raw)
+  seen = set()
+  last_exc: Exception | None = None
+  for candidate in candidates:
+    if candidate in seen:
+      continue
+    seen.add(candidate)
+    try:
+      obj, _idx = decoder.raw_decode(candidate)
+      if isinstance(obj, (dict, list)):
+        return obj
+    except Exception as exc:
+      last_exc = exc
+      repaired = repair_json_suffix(candidate)
+      if repaired != candidate:
+        try:
+          obj = json.loads(repaired)
+          if isinstance(obj, (dict, list)):
+            return obj
+        except Exception as exc2:
+          last_exc = exc2
+  if last_exc:
+    raise last_exc
+  return None
+
+
+def build_score_prompt(query: str, documents: List[str]) -> List[Dict[str, str]]:
+  doc_lines = []
+  for idx, doc in enumerate(documents):
+    doc_lines.append(f"[{idx}]\n{doc}")
+  docs_block = "\n\n".join(doc_lines)
+  return [
+    {
+      'role': 'system',
+      'content': (
+        'You are a paper ranking assistant. '
+        'Score each candidate paper against the query on a 0-100 scale. '
+        'Higher score means stronger match to the query intent. '
+        'Return strict JSON only.'
+      ),
+    },
+    {
+      'role': 'user',
+      'content': (
+        f'Query:\n{query}\n\n'
+        'Candidates:\n'
+        f'{docs_block}\n\n'
+        'Return JSON in this format:\n'
+        '{"results":[{"index":0,"score":83}]}\n'
+        'Rules:\n'
+        '- Every candidate index must appear exactly once.\n'
+        '- score must be a number between 0 and 100.\n'
+        '- Do not add markdown fences or extra text.'
+      ),
+    },
+  ]
+
+
+def parse_score_results(content: str, expected_count: int) -> List[Dict[str, float]]:
+  payload = parse_llm_json(content)
+  if not isinstance(payload, dict):
+    raise ValueError('score payload must be a JSON object')
+  results = payload.get('results')
+  if not isinstance(results, list):
+    raise ValueError('score payload missing results list')
+  parsed: List[Dict[str, float]] = []
+  seen: set[int] = set()
+  for item in results:
+    if not isinstance(item, dict):
+      continue
+    try:
+      idx = int(item.get('index'))
+      score = float(item.get('score'))
+    except Exception as exc:
+      raise ValueError(f'invalid score item: {item}') from exc
+    if idx < 0 or idx >= expected_count:
+      raise ValueError(f'index out of range: {idx}')
+    if idx in seen:
+      raise ValueError(f'duplicate index: {idx}')
+    seen.add(idx)
+    parsed.append({'index': idx, 'score': max(0.0, min(score, 100.0))})
+  if len(parsed) != expected_count:
+    raise ValueError(f'incomplete score results: expected={expected_count} actual={len(parsed)}')
+  parsed.sort(key=lambda item: item['index'])
+  return parsed
+
+
+def fallback_batch_scores(batch_docs: List[str]) -> List[Dict[str, float]]:
+  total = max(len(batch_docs), 1)
+  return [
+    {'index': idx, 'score': float(total - idx)}
+    for idx, _doc in enumerate(batch_docs)
+  ]
+
+
+def score_documents_with_llm(
+  client: GeminiClient,
+  query: str,
+  documents: List[str],
+) -> List[Dict[str, float]]:
+  messages = build_score_prompt(query, documents)
+  last_error: Exception | None = None
+  for response_format in ({'type': 'json_object'}, None):
+    try:
+      response = client.chat(messages=messages, response_format=response_format)
+      return parse_score_results(response.get('content') or '', len(documents))
+    except Exception as exc:
+      last_error = exc
+  if last_error is not None:
+    raise last_error
+  raise RuntimeError('score_documents_with_llm failed without response')
 
 
 def log(message: str) -> None:
@@ -237,8 +421,136 @@ def rrf_merge(scores: Dict[int, float], rank_idx: int, orig_idx: int) -> None:
   scores[orig_idx] = scores.get(orig_idx, 0.0) + 1.0 / (RRF_K + rank_idx)
 
 
+def build_ranked_results(
+  score_map: Dict[int, float],
+  top_ids: List[str],
+  top_n: Optional[int],
+) -> List[Dict[str, Any]]:
+  if not score_map:
+    return []
+
+  sorted_items = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
+  if top_n is not None:
+    sorted_items = sorted_items[:top_n]
+
+  score_values = [v for _, v in sorted_items]
+  min_score = min(score_values)
+  max_score = max(score_values)
+  denom = max_score - min_score if max_score > min_score else 1.0
+
+  ranked_for_query: List[Dict[str, Any]] = []
+  for idx, raw_score in sorted_items:
+    norm_score = (raw_score - min_score) / denom
+    paper_id = top_ids[idx]
+    ranked_for_query.append(
+      {
+        'paper_id': paper_id,
+        'score': norm_score,
+        'star_rating': score_to_stars(norm_score),
+      }
+    )
+
+  ranked_for_query.sort(key=lambda x: x['score'], reverse=True)
+  return ranked_for_query
+
+
+def rerank_query_with_gateway(
+  reranker: GeminiClient,
+  q_text: str,
+  top_ids: List[str],
+  papers_by_id: Dict[str, Dict[str, Any]],
+  encoder,
+  top_n: Optional[int],
+  q_idx: int,
+  total_queries: int,
+  tag: str,
+) -> List[Dict[str, Any]]:
+  documents = build_documents(papers_by_id, top_ids)
+  docs_with_idx = list(enumerate(documents))
+  random.shuffle(docs_with_idx)
+
+  query_tokens = estimate_tokens(q_text, encoder)
+  batches = iter_batches(docs_with_idx, query_tokens, encoder)
+  log(
+    f"[INFO] Query {q_idx}/{total_queries} tag={tag} | candidates={len(top_ids)} "
+    f"| batches={len(batches)} | query_tokens≈{query_tokens}"
+  )
+
+  rrf_scores: Dict[int, float] = {}
+  for batch_idx, (batch_indices, batch_docs) in enumerate(batches, 1):
+    log(
+      f"[INFO] 发送批次 {batch_idx}/{len(batches)} | docs={len(batch_docs)}"
+    )
+    response = reranker.rerank(
+      query=q_text,
+      documents=batch_docs,
+      top_n=len(batch_docs),
+      model=getattr(reranker, "model", None),
+    )
+    if isinstance(response, dict) and 'output' in response:
+      results = response.get('output', {}).get('results', [])
+    else:
+      results = response.get('results', [])
+
+    ranked = sorted(
+      results or [],
+      key=lambda x: x.get('relevance_score', x.get('score', 0.0)),
+      reverse=True,
+    )
+    for rank_idx, item in enumerate(ranked, start=1):
+      idx = int(item.get('index', -1))
+      if idx < 0 or idx >= len(batch_indices):
+        continue
+      orig_idx = batch_indices[idx]
+      rrf_merge(rrf_scores, rank_idx, orig_idx)
+
+  return build_ranked_results(rrf_scores, top_ids, top_n)
+
+
+def rerank_query_with_llm_scores(
+  reranker: GeminiClient,
+  q_text: str,
+  top_ids: List[str],
+  papers_by_id: Dict[str, Dict[str, Any]],
+  encoder,
+  top_n: Optional[int],
+  q_idx: int,
+  total_queries: int,
+  tag: str,
+) -> List[Dict[str, Any]]:
+  documents = build_documents(papers_by_id, top_ids)
+  docs_with_idx = list(enumerate(documents))
+
+  query_tokens = estimate_tokens(q_text, encoder)
+  batches = iter_batches(docs_with_idx, query_tokens, encoder)
+  log(
+    f"[INFO] Query {q_idx}/{total_queries} tag={tag} | candidates={len(top_ids)} "
+    f"| batches={len(batches)} | query_tokens≈{query_tokens} | strategy=gemini_score"
+  )
+
+  score_map: Dict[int, float] = {}
+  for batch_idx, (batch_indices, batch_docs) in enumerate(batches, 1):
+    log(
+      f"[INFO] Gemini 评分批次 {batch_idx}/{len(batches)} | docs={len(batch_docs)}"
+    )
+    try:
+      batch_scores = score_documents_with_llm(reranker, q_text, batch_docs)
+    except Exception as exc:
+      log(f"[WARN] Gemini 评分失败，回退原始顺序评分：{exc}")
+      batch_scores = fallback_batch_scores(batch_docs)
+
+    for item in batch_scores:
+      idx = int(item['index'])
+      if idx < 0 or idx >= len(batch_indices):
+        continue
+      orig_idx = batch_indices[idx]
+      score_map[orig_idx] = float(item['score'])
+
+  return build_ranked_results(score_map, top_ids, top_n)
+
+
 def process_file(
-  reranker: BltClient,
+  reranker: GeminiClient,
   input_path: str,
   output_path: str,
   top_n: Optional[int],
@@ -297,6 +609,11 @@ def process_file(
     f"max_chars={MAX_CHARS_PER_DOC}，token_safety={TOKEN_SAFETY}"
   )
 
+  use_gateway_rerank = getattr(
+    reranker,
+    'supports_rerank',
+    lambda: hasattr(reranker, 'rerank'),
+  )()
   for q_idx, q in enumerate(queries, start=1):
     q_text = (q.get("rewrite") or q.get("query_text") or "").strip()
     top_ids = list(global_candidate_ids)
@@ -304,79 +621,37 @@ def process_file(
       continue
 
     group_start(f"Query {q_idx}/{len(queries)} tag={q.get('tag') or ''}")
-    documents = build_documents(papers_by_id, top_ids)
-    docs_with_idx = list(enumerate(documents))
-    random.shuffle(docs_with_idx)
-
-    query_tokens = estimate_tokens(q_text, encoder)
-    batches = iter_batches(docs_with_idx, query_tokens, encoder)
-    log(
-      f"[INFO] Query {q_idx}/{len(queries)} tag={q.get('tag') or ''} | candidates={len(top_ids)} "
-      f"| batches={len(batches)} | query_tokens≈{query_tokens}"
-    )
-
-    rrf_scores: Dict[int, float] = {}
-
     try:
-      for batch_idx, (batch_indices, batch_docs) in enumerate(batches, 1):
-        log(
-          f"[INFO] 发送批次 {batch_idx}/{len(batches)} | docs={len(batch_docs)}"
+      if use_gateway_rerank:
+        ranked_for_query = rerank_query_with_gateway(
+          reranker,
+          q_text,
+          top_ids,
+          papers_by_id,
+          encoder,
+          top_n,
+          q_idx,
+          len(queries),
+          q.get('tag') or '',
         )
-        response = reranker.rerank(
-          query=q_text,
-          documents=batch_docs,
-          top_n=len(batch_docs),
-          model=rerank_model,
+      else:
+        ranked_for_query = rerank_query_with_llm_scores(
+          reranker,
+          q_text,
+          top_ids,
+          papers_by_id,
+          encoder,
+          top_n,
+          q_idx,
+          len(queries),
+          q.get('tag') or '',
         )
-        if isinstance(response, dict) and "output" in response:
-          results = response.get("output", {}).get("results", [])
-        else:
-          results = response.get("results", [])
-
-        ranked = sorted(
-          results or [],
-          key=lambda x: x.get("relevance_score", x.get("score", 0.0)),
-          reverse=True,
-        )
-        for rank_idx, item in enumerate(ranked, start=1):
-          idx = int(item.get("index", -1))
-          if idx < 0 or idx >= len(batch_indices):
-            continue
-          orig_idx = batch_indices[idx]
-          rrf_merge(rrf_scores, rank_idx, orig_idx)
-
-      if not rrf_scores:
+      if not ranked_for_query:
         log("[WARN] 本次 query 未得到有效 rerank 结果，跳过。")
         continue
+      q["ranked"] = ranked_for_query
     finally:
       group_end()
-
-    if not rrf_scores:
-      continue
-
-    sorted_items = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    if top_n is not None:
-      sorted_items = sorted_items[:top_n]
-
-    rrf_values = [v for _, v in sorted_items]
-    min_rrf = min(rrf_values)
-    max_rrf = max(rrf_values)
-    denom = max_rrf - min_rrf if max_rrf > min_rrf else 1.0
-
-    ranked_for_query: List[Dict[str, Any]] = []
-    for idx, rrf_score in sorted_items:
-      norm_score = (rrf_score - min_rrf) / denom
-      paper_id = top_ids[idx]
-      ranked_for_query.append(
-        {
-          "paper_id": paper_id,
-          "score": norm_score,
-          "star_rating": score_to_stars(norm_score),
-        }
-      )
-
-    ranked_for_query.sort(key=lambda x: x["score"], reverse=True)
-    q["ranked"] = ranked_for_query
 
   meta_generated_at = data.get("generated_at") or ""
   data["reranked_at"] = datetime.now(timezone.utc).isoformat()
@@ -388,7 +663,7 @@ def process_file(
 
 def main() -> None:
   parser = argparse.ArgumentParser(
-    description="步骤 3：使用 BLT Rerank API 对候选论文做重排序（简化版）。",
+    description="步骤 3：使用 Gemini 评分或兼容旧网关的 rerank 接口对候选论文做重排序。",
   )
   parser.add_argument(
     "--input",
@@ -411,8 +686,8 @@ def main() -> None:
   parser.add_argument(
     "--rerank-model",
     type=str,
-    default=os.getenv("BLT_RERANK_MODEL") or os.getenv("RERANK_MODEL") or "qwen3-reranker-4b",
-    help="BLT Rerank 模型名称（默认 qwen3-reranker-4b）。",
+    default=resolve_model_env("GEMINI_RERANK_MODEL", "BLT_RERANK_MODEL", "gemini-3-flash-preview"),
+    help="排序阶段使用的模型名称（默认 gemini-3-flash-preview）。",
   )
 
   args = parser.parse_args()
@@ -429,11 +704,11 @@ def main() -> None:
     log(f"[WARN] 输入文件不存在（今天可能没有新论文）：{input_path}，将跳过 Step 3。")
     return
 
-  api_key = os.getenv("BLT_API_KEY")
+  api_key = resolve_gemini_api_key()
   if not api_key:
-    raise RuntimeError("缺少 BLT_API_KEY 环境变量，无法调用 BLT Rerank API。")
+    raise RuntimeError("缺少 GEMINI_API_KEY 环境变量（兼容旧 BLT_API_KEY），无法调用排序模型。")
 
-  reranker = BltClient(api_key=api_key, model=args.rerank_model)
+  reranker = GeminiClient(api_key=api_key, model=args.rerank_model)
   process_file(
     reranker=reranker,
     input_path=input_path,

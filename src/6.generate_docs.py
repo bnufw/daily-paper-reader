@@ -15,9 +15,27 @@ from urllib.parse import quote_plus
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
-import fitz  # PyMuPDF
+try:
+    import fitz  # type: ignore  # PyMuPDF
+except Exception:
+    fitz = None
 import requests
-from llm import BltClient
+try:
+    from llm import GeminiClient, resolve_gemini_api_key, resolve_model_env
+except ImportError:
+    from llm import BltClient as GeminiClient  # type: ignore
+
+    def resolve_gemini_api_key() -> str:
+        return (
+            os.getenv("GEMINI_API_KEY")
+            or os.getenv("BLT_API_KEY")
+            or os.getenv("LLM_API_KEY")
+            or ""
+        )
+
+    def resolve_model_env(primary_name: str, legacy_name: str, default: str) -> str:
+        return os.getenv(primary_name) or os.getenv(legacy_name) or default
+
 
 SCRIPT_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -25,18 +43,18 @@ CONFIG_FILE = os.path.join(ROOT_DIR, "config.yaml")
 TODAY_STR = str(os.getenv("DPR_RUN_DATE") or "").strip() or datetime.now(timezone.utc).strftime("%Y%m%d")
 RANGE_DATE_RE = re.compile(r"^(\d{8})-(\d{8})$")
 
-# LLM 配置（使用 llm.py 内的 BLT 客户端）
-BLT_API_KEY = os.getenv("BLT_API_KEY")
-BLT_MODEL = os.getenv("BLT_SUMMARY_MODEL", "gemini-3-flash-preview")
+# LLM 配置（默认使用 Gemini 官方 OpenAI 兼容接口；兼容旧 BLT 环境变量）
+GEMINI_API_KEY = resolve_gemini_api_key()
+GEMINI_MODEL = resolve_model_env("GEMINI_SUMMARY_MODEL", "BLT_SUMMARY_MODEL", "gemini-3-flash-preview")
 LLM_CLIENT = None
-if BLT_API_KEY:
-    LLM_CLIENT = BltClient(api_key=BLT_API_KEY, model=BLT_MODEL)
+if GEMINI_API_KEY:
+    LLM_CLIENT = GeminiClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL)
 
 DEFAULT_DOCS_CONCURRENCY = 4
 
 
-def call_blt_text(
-    client: BltClient,
+def call_llm_text(
+    client: GeminiClient,
     messages: List[Dict[str, str]],
     temperature: float,
     max_tokens: int,
@@ -189,6 +207,8 @@ def slugify(title: str) -> str:
 
 
 def extract_pdf_text(pdf_path: str) -> str:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF 未安装，无法解析 PDF")
     doc = fitz.open(pdf_path)
     texts = []
     try:
@@ -358,7 +378,7 @@ def translate_title_and_abstract_to_zh(title: str, abstract: str) -> Tuple[str, 
                 "json_schema": {"name": "translate_zh", "schema": schema, "strict": True},
             }
 
-        content = call_blt_text(
+        content = call_llm_text(
             LLM_CLIENT,
             messages,
             temperature=0.2,
@@ -563,7 +583,7 @@ def upsert_glance_block_in_text(md_text: str, glance: str) -> str:
 
 def generate_deep_summary(md_file_path: str, txt_file_path: str, max_retries: int = 3) -> str | None:
     if LLM_CLIENT is None:
-        log("[WARN] 未配置 BLT_API_KEY，跳过精读总结。")
+        log("[WARN] 未配置 GEMINI_API_KEY（兼容旧 BLT_API_KEY），跳过精读总结。")
         return None
     if not os.path.exists(md_file_path):
         return None
@@ -603,7 +623,7 @@ def generate_deep_summary(md_file_path: str, txt_file_path: str, max_retries: in
     last = ""
     for attempt in range(1, max_retries + 1):
         try:
-            summary = call_blt_text(LLM_CLIENT, messages, temperature=0.3, max_tokens=4096)
+            summary = call_llm_text(LLM_CLIENT, messages, temperature=0.3, max_tokens=4096)
             summary = (summary or "").strip()
             if not summary:
                 continue
@@ -618,7 +638,7 @@ def generate_deep_summary(md_file_path: str, txt_file_path: str, max_retries: in
                 {"role": "user", "content": "你上一次的总结可能被截断了，请从中断处继续补全，不要重复已输出内容。"},
                 {"role": "user", "content": f"上一次输出如下：\n\n{summary}\n\n请继续补全，最后以一行“（完）”结束。"},
             ]
-            cont = call_blt_text(LLM_CLIENT, cont_messages, temperature=0.3, max_tokens=2048)
+            cont = call_llm_text(LLM_CLIENT, cont_messages, temperature=0.3, max_tokens=2048)
             cont = (cont or "").strip()
             merged = f"{summary}\n\n{cont}".strip()
             if os.getenv("DPR_DEBUG_STEP6") == "1":
@@ -681,7 +701,7 @@ def generate_glance_overview(title: str, abstract: str, max_retries: int = 3) ->
 
     for attempt in range(1, max_retries + 1):
         try:
-            content = call_blt_text(
+            content = call_llm_text(
                 LLM_CLIENT,
                 messages,
                 temperature=0.2,
@@ -1005,7 +1025,7 @@ def build_daily_brief_summary(
         "直接输出 1-3 行文本，不要 Markdown 标题，也不要 JSON。"
     )
     try:
-        content = call_blt_text(
+        content = call_llm_text(
             LLM_CLIENT,
             [
                 {"role": "system", "content": system_prompt},

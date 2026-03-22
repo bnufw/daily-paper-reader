@@ -2,13 +2,14 @@ import os
 import time
 from typing import List, Dict, Tuple, Any, Optional
 
+import re
 import requests
 
 """
 统一的 LLM 客户端封装。
 
 提供商/模型命名规则：'provider/model'，provider 大小写不敏感，model 保留大小写与路径。
-当前支持：deepseek、siliconflow、ollama、blt、cstcloud（科技云）。
+当前支持：gemini、deepseek、siliconflow、ollama、cstcloud（科技云）。
 """
 
 # 单次实验级别的全局 token 统计（需由调用方在实验开始前手动 reset）
@@ -21,8 +22,32 @@ GLOBAL_TOKENS = {
 # 单次实验级别的全局时间统计（秒）
 GLOBAL_TIME_SECONDS: float = 0.0
 
-PRIMARY_LLM_BASE_URL = "https://api.gptbest.vip/v1"
-DEFAULT_BLT_BASE_URL = "https://api.bltcy.ai/v1"
+PRIMARY_LEGACY_BLT_BASE_URL = "https://api.gptbest.vip/v1"
+DEFAULT_LEGACY_BLT_BASE_URL = "https://api.bltcy.ai/v1"
+DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def _env_first(*names: str) -> str:
+    for name in names:
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def normalize_openai_base_url(url: str | None) -> str:
+    candidate = str(url or "").strip()
+    if not candidate:
+        return ""
+    return re.sub(r"/chat/completions/?$", "", candidate.rstrip("/"), flags=re.IGNORECASE)
+
+
+def resolve_gemini_api_key() -> str:
+    return _env_first("GEMINI_API_KEY", "BLT_API_KEY", "LLM_API_KEY")
+
+
+def resolve_model_env(primary_name: str, legacy_name: str, default: str) -> str:
+    return _env_first(primary_name, legacy_name) or default
 
 
 def reset_global_tokens():
@@ -95,7 +120,7 @@ class LLMClient:
         for url in urls:
             if not url:
                 continue
-            candidate = str(url).strip().rstrip("/")
+            candidate = normalize_openai_base_url(url)
             if candidate and candidate not in out:
                 out.append(candidate)
         return out
@@ -121,6 +146,8 @@ class LLMClient:
     def _provider_name(self, base_url: str | None = None) -> str:
         try:
             url = (base_url or self.base_url or '').lower()
+            if 'generativelanguage.googleapis.com' in url or '/openai' in url and 'googleapis' in url:
+                return 'gemini'
             if 'deepseek' in url:
                 return 'deepseek'
             if 'siliconflow' in url or 'siliconflow.cn' in url:
@@ -142,7 +169,7 @@ class LLMClient:
         统一 Chat Completions 请求。
 
         :param messages: OpenAI 格式的消息列表
-        :param response_format: 可选，结构化输出配置（柏拉图支持）
+        :param response_format: 可选，结构化输出配置（OpenAI 兼容端点按需支持）
         """
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -197,8 +224,8 @@ class LLMClient:
                     raise
 
                 debug_raw = os.getenv("BLT_DEBUG_RAW") == "1" or os.getenv("LLM_DEBUG_RAW") == "1"
-                if debug_raw and self._provider_name(req_base) == "blt":
-                    print("[DEBUG] BLT 原始响应包:", response.text)
+                if debug_raw:
+                    print("[DEBUG] 原始响应包:", response.text)
 
                 if isinstance(response_data, dict) and 'error' in response_data:
                     err = response_data.get('error') or {}
@@ -321,8 +348,11 @@ class LLMClient:
         top_n: Optional[int] = None,
         model: Optional[str] = None,
     ) -> dict:
-        """重排序接口（默认不支持，只有 BLT 提供）。"""
-        raise NotImplementedError("rerank 仅支持 BltClient，请使用 BltClient 调用。")
+        """重排序接口（默认不支持，仅部分兼容网关提供）。"""
+        raise NotImplementedError("当前客户端未提供专用 rerank 接口。")
+
+    def supports_rerank(self) -> bool:
+        return False
 
 
 class DeepSeekClient(LLMClient):
@@ -354,18 +384,35 @@ class OllamaClient(LLMClient):
         super().__init__(api_key=api_key, model=model, base_url=base_url)
 
 
-class BltClient(LLMClient):
-    """BLT（柏拉图）网关，OpenAI Chat Completions 兼容接口。"""
-    def __init__(self, api_key: str, model: str, base_url: str = None):
-        legacy_base = base_url or os.getenv('BLT_API_BASE', DEFAULT_BLT_BASE_URL)
-        primary_base = (
-            os.getenv("LLM_PRIMARY_BASE_URL")
-            or os.getenv("BLT_PRIMARY_BASE_URL")
-            or os.getenv("GPTBEST_BASE_URL")
-            or PRIMARY_LLM_BASE_URL
-        ).strip() or PRIMARY_LLM_BASE_URL
-        super().__init__(api_key=api_key, model=model, base_url=primary_base)
-        self._base_urls = self._normalize_base_urls([primary_base, legacy_base])
+class GeminiClient(LLMClient):
+    """Gemini 官方 OpenAI 兼容接口；旧 BLT 环境变量仍可兼容原网关。"""
+
+    def __init__(self, api_key: str, model: str, base_url: str | None = None):
+        explicit_base = normalize_openai_base_url(base_url)
+        env_gemini_base = normalize_openai_base_url(_env_first("GEMINI_BASE_URL", "LLM_BASE_URL"))
+        legacy_base = normalize_openai_base_url(
+            _env_first("BLT_API_BASE") or DEFAULT_LEGACY_BLT_BASE_URL
+        )
+        if explicit_base:
+            base_urls = [explicit_base]
+        elif env_gemini_base:
+            base_urls = [env_gemini_base]
+        elif _env_first("GEMINI_API_KEY"):
+            base_urls = [DEFAULT_GEMINI_BASE_URL]
+        elif _env_first("BLT_API_KEY"):
+            primary_base = (
+                _env_first("LLM_PRIMARY_BASE_URL", "BLT_PRIMARY_BASE_URL", "GPTBEST_BASE_URL")
+                or PRIMARY_LEGACY_BLT_BASE_URL
+            )
+            base_urls = [primary_base, legacy_base]
+        else:
+            base_urls = [DEFAULT_GEMINI_BASE_URL]
+        super().__init__(api_key=api_key, model=model, base_url=base_urls[0])
+        self._base_urls = self._normalize_base_urls(base_urls)
+        self._supports_legacy_rerank = any(self._provider_name(base) == "blt" for base in self._base_urls)
+
+    def supports_rerank(self) -> bool:
+        return bool(self._supports_legacy_rerank)
 
     def rerank(
         self,
@@ -374,14 +421,8 @@ class BltClient(LLMClient):
         top_n: Optional[int] = None,
         model: Optional[str] = None,
     ) -> dict:
-        """
-        调用柏拉图 Rerank 接口（/v1/rerank）。
-
-        :param query: 查询文本
-        :param documents: 待排序文档列表
-        :param top_n: 返回的 Top N（可选）
-        :param model: 重排模型名（可选，默认使用 self.model）
-        """
+        if not self.supports_rerank():
+            raise NotImplementedError("当前 Gemini 客户端未提供专用 rerank 接口。")
         if not query:
             raise ValueError("rerank: query 不能为空")
         if not documents:
@@ -439,7 +480,7 @@ class BltClient(LLMClient):
                     "documents": len(documents),
                     "top_n": payload.get("top_n"),
                 })
-                if e.response is not None:
+                if getattr(e, "response", None) is not None:
                     try:
                         print("错误详情(JSON):", e.response.json())
                     except ValueError:
@@ -454,6 +495,9 @@ class BltClient(LLMClient):
         if last_error is not None:
             raise last_error
         raise RuntimeError("rerank 未命中可用 base")
+
+
+BltClient = GeminiClient
 
 
 def parse_provider_model(model_str: str) -> Tuple[str, str]:
@@ -501,11 +545,13 @@ class ClientFactory:
         if provider == 'ollama':
             base_url = base_url or "http://localhost:11111/v1"
             return OllamaClient(api_key=api_key or '', model=model, base_url=base_url)
+        if provider in ('gemini', 'google'):
+            return GeminiClient(api_key=api_key or resolve_gemini_api_key(), model=model, base_url=base_url or _env_first('GEMINI_BASE_URL', 'LLM_BASE_URL'))
         if provider in ('blt', 'bltcy', 'plato'):
-            return BltClient(api_key=api_key or os.getenv('BLT_API_KEY', ''), model=model, base_url=base_url or os.getenv('BLT_API_BASE', 'https://api.bltcy.ai/v1'))
+            return GeminiClient(api_key=api_key or resolve_gemini_api_key(), model=model, base_url=base_url or _env_first('GEMINI_BASE_URL', 'BLT_API_BASE', 'LLM_BASE_URL'))
         if provider in ('cstcloud', 'cst', 'cst-cloud', 'keji', 'keji-yun'):
             return CSTCloudClient(api_key=api_key or os.getenv('CSTCLOUD_API_KEY', ''), model=model, base_url=base_url or 'https://uni-api.cstcloud.cn/v1')
-        raise ValueError(f"不支持的提供商: {provider}，请使用 'deepseek'、'siliconflow'、'blt'、'cstcloud' 或 'ollama'")
+        raise ValueError(f"不支持的提供商: {provider}，请使用 'gemini'、'deepseek'、'siliconflow'、'blt'、'cstcloud' 或 'ollama'")
 
     @staticmethod
     def from_config(_config: dict | None = None):

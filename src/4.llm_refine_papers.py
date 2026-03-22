@@ -10,7 +10,22 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List
 
-from llm import BltClient
+try:
+    from llm import GeminiClient, resolve_gemini_api_key, resolve_model_env
+except ImportError:
+    from llm import BltClient as GeminiClient  # type: ignore
+
+    def resolve_gemini_api_key() -> str:
+        return (
+            os.getenv("GEMINI_API_KEY")
+            or os.getenv("BLT_API_KEY")
+            or os.getenv("LLM_API_KEY")
+            or ""
+        )
+
+    def resolve_model_env(primary_name: str, legacy_name: str, default: str) -> str:
+        return os.getenv(primary_name) or os.getenv(legacy_name) or default
+
 from subscription_plan import build_pipeline_inputs
 
 SCRIPT_DIR = os.path.dirname(__file__)
@@ -20,7 +35,7 @@ ARCHIVE_DIR = os.path.join(ROOT_DIR, "archive", TODAY_STR)
 RANKED_DIR = os.path.join(ARCHIVE_DIR, "rank")
 CONFIG_FILE = os.path.join(ROOT_DIR, "config.yaml")
 
-DEFAULT_FILTER_MODEL = os.getenv("BLT_FILTER_MODEL") or "gemini-3-flash-preview-nothinking"
+DEFAULT_FILTER_MODEL = resolve_model_env("GEMINI_FILTER_MODEL", "BLT_FILTER_MODEL", "gemini-3-flash-preview")
 DEFAULT_FILTER_CONCURRENCY = 4
 MAX_FILTER_RETRIES = 3
 
@@ -309,7 +324,7 @@ def build_repeated_user_prompt(query: str) -> str:
 
 
 def call_filter(
-    client: BltClient,
+    client: GeminiClient,
     all_requirements: List[Dict[str, str]],
     docs: List[Dict[str, str]],
     debug_dir: str,
@@ -688,14 +703,14 @@ def recover_filter_results(
     )
 
 
-def _make_filter_client(api_key: str, model: str, max_output_tokens: int) -> BltClient:
-    client = BltClient(api_key=api_key, model=model)
+def _make_filter_client(api_key: str, model: str, max_output_tokens: int) -> GeminiClient:
+    client = GeminiClient(api_key=api_key, model=model)
     client.kwargs.update({"temperature": 0.1, "max_tokens": max_output_tokens})
     return client
 
 
 def _make_filter_runner(
-    client: BltClient,
+    client: GeminiClient,
     all_requirements: List[Dict[str, str]],
     debug_dir: str,
     base_tag: str,
@@ -821,9 +836,9 @@ def process_file(
         return
     paper_map = build_paper_map(papers)
 
-    api_key = os.getenv("BLT_API_KEY")
+    api_key = resolve_gemini_api_key()
     if not api_key:
-        raise RuntimeError("missing BLT_API_KEY")
+        raise RuntimeError("missing GEMINI_API_KEY (or legacy BLT_API_KEY)")
 
     group_start(f"Step 4 - llm refine {os.path.basename(input_path)}")
     log(
@@ -990,7 +1005,7 @@ def main() -> None:
         "--filter-model",
         type=str,
         default=DEFAULT_FILTER_MODEL,
-        help="model for filter (gemini-3-flash-preview-nothinking).",
+        help="model for filter (default: gemini-3-flash-preview).",
     )
     parser.add_argument(
         "--max-output-tokens",

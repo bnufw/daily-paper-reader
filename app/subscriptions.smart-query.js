@@ -21,6 +21,29 @@ window.SubscriptionsSmartQuery = (function () {
   let modalPanel = null;
   let modalState = null;
 
+  const LLM_API_UTILS = (() => {
+    const utils = window.DPRLLMApiUtils || {};
+    return {
+      defaultBaseUrl:
+        utils.DEFAULT_GEMINI_OPENAI_BASE_URL ||
+        'https://generativelanguage.googleapis.com/v1beta/openai',
+      resolveEndpoint:
+        typeof utils.resolveChatCompletionsEndpoint === 'function'
+          ? utils.resolveChatCompletionsEndpoint
+          : (value, fallbackBaseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai') => {
+              const raw = String(value || '').trim() || fallbackBaseUrl;
+              if (!raw) return '';
+              const normalized = raw
+                .replace(/\/chat\/completions\/?$/i, '')
+                .replace(/\/+$/, '');
+              if (/\/openai$/i.test(normalized) || /\/v\d+(?:beta\d+)?$/i.test(normalized)) {
+                return `${normalized}/chat/completions`;
+              }
+              return `${normalized}/v1/chat/completions`;
+            },
+    };
+  })();
+
   const defaultPromptTemplate = [
     'You are a retrieval planning assistant.',
     '标签 (Tag): {{TAG}}',
@@ -332,7 +355,7 @@ window.SubscriptionsSmartQuery = (function () {
   const loadLlmConfig = () => {
     const secret = window.decoded_secret_private || {};
     const summarized = secret.summarizedLLM || {};
-    const baseUrl = normalizeText(summarized.baseUrl || '');
+    const baseUrl = normalizeText(summarized.baseUrl || '') || LLM_API_UTILS.defaultBaseUrl;
     const apiKey = normalizeText(summarized.apiKey || '');
     const model = normalizeText(summarized.model || '');
     if (baseUrl && apiKey && model) return { baseUrl, apiKey, model };
@@ -340,7 +363,7 @@ window.SubscriptionsSmartQuery = (function () {
     const chatLLMs = Array.isArray(secret.chatLLMs) ? secret.chatLLMs : [];
     if (chatLLMs.length > 0) {
       const first = chatLLMs[0] || {};
-      const cBase = normalizeText(first.baseUrl || '');
+      const cBase = normalizeText(first.baseUrl || '') || LLM_API_UTILS.defaultBaseUrl;
       const cKey = normalizeText(first.apiKey || '');
       const models = Array.isArray(first.models) ? first.models : [];
       const cModel = normalizeText(models[0] || '');
@@ -656,31 +679,13 @@ window.SubscriptionsSmartQuery = (function () {
       const pushUnique = (u) => {
         if (u && !out.includes(u)) out.push(u);
       };
-      const expandEndpoint = (base) => {
-        const src = normalizeText(base).replace(/\/+$/, '');
-        if (!src) return;
-        if (src.includes('/chat/completions')) {
-          pushUnique(src);
-          pushUnique(src.replace(/\/chat\/completions$/, '/v1/chat/completions'));
-          return;
-        }
-        if (/\/v\d+$/i.test(src)) {
-          pushUnique(`${src}/chat/completions`);
-          pushUnique(`${src}/v1/chat/completions`);
-          return;
-        }
-        pushUnique(`${src}/v1/chat/completions`);
-        pushUnique(`${src}/chat/completions`);
-      };
-
-      expandEndpoint('https://hk-api.gptbest.vip');
-      expandEndpoint('https://api.bltcy.ai');
-
-      const raw = normalizeText(llm.baseUrl);
+      const raw = normalizeText(llm.baseUrl) || LLM_API_UTILS.defaultBaseUrl;
       if (!raw) {
         return out;
       }
-      expandEndpoint(raw);
+      pushUnique(
+        LLM_API_UTILS.resolveEndpoint(raw, LLM_API_UTILS.defaultBaseUrl),
+      );
       return out;
     };
     const endpoints = buildEndpoints();

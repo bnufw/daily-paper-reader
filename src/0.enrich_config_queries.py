@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # 自动补全 config.yaml 中的 related / rewrite 字段：
-# - keywords 缺少 related 时，调用 BLT gpt-4o-mini 生成相关词
-# - llm_queries 缺少 rewrite 时，调用 BLT gpt-4o-mini 生成英文改写
+# - keywords 缺少 related 时，调用 Gemini 生成相关词
+# - llm_queries 缺少 rewrite 时，调用 Gemini 生成英文改写
 
 import os
 import json
@@ -10,12 +10,27 @@ from typing import Any, Dict, List
 
 import yaml  # type: ignore
 
-from llm import BltClient
+try:
+    from llm import GeminiClient, resolve_gemini_api_key, resolve_model_env
+except ImportError:
+    from llm import BltClient as GeminiClient  # type: ignore
+
+    def resolve_gemini_api_key() -> str:
+        return (
+            os.getenv("GEMINI_API_KEY")
+            or os.getenv("BLT_API_KEY")
+            or os.getenv("LLM_API_KEY")
+            or ""
+        )
+
+    def resolve_model_env(primary_name: str, legacy_name: str, default: str) -> str:
+        return os.getenv(primary_name) or os.getenv(legacy_name) or default
+
 
 SCRIPT_DIR = os.path.dirname(__file__)
 CONFIG_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config.yaml"))
 
-MODEL_NAME = os.getenv("BLT_REWRITE_MODEL", "gemini-3-flash-preview")
+MODEL_NAME = resolve_model_env("GEMINI_REWRITE_MODEL", "BLT_REWRITE_MODEL", "gemini-3-flash-preview")
 
 def log(message: str) -> None:
   ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -106,7 +121,7 @@ def build_rewrite_prompt(query: str) -> List[Dict[str, str]]:
   ]
 
 
-def call_llm_json(client: BltClient, messages: List[Dict[str, str]], schema_name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+def call_llm_json(client: GeminiClient, messages: List[Dict[str, str]], schema_name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
   response_format = {
     "type": "json_schema",
     "json_schema": {
@@ -136,9 +151,9 @@ def main() -> None:
     if not os.path.exists(CONFIG_FILE):
         raise FileNotFoundError(f"找不到 config.yaml：{CONFIG_FILE}")
 
-    api_key = os.getenv("BLT_API_KEY")
+    api_key = resolve_gemini_api_key()
     if not api_key:
-        raise RuntimeError("缺少 BLT_API_KEY 环境变量，无法调用 BLT。")
+        raise RuntimeError("缺少 GEMINI_API_KEY 环境变量（兼容读取旧 BLT_API_KEY），无法调用 Gemini。")
 
     group_start("Step 0.0 - load config")
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -149,7 +164,7 @@ def main() -> None:
     keywords = subs.get("keywords") or []
     llm_queries = subs.get("llm_queries") or []
 
-    client = BltClient(api_key=api_key, model=MODEL_NAME)
+    client = GeminiClient(api_key=api_key, model=MODEL_NAME)
 
     related_schema = {
       "type": "object",

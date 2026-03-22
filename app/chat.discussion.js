@@ -5,6 +5,29 @@ window.PrivateDiscussionChat = (function () {
   const CHAT_STORE_NAME = 'paper_chats';
   const CHAT_MODEL_PREF_KEY = 'dpr_chat_model_preference_v1';
 
+  const LLM_API_UTILS = (() => {
+    const utils = window.DPRLLMApiUtils || {};
+    return {
+      defaultBaseUrl:
+        utils.DEFAULT_GEMINI_OPENAI_BASE_URL ||
+        'https://generativelanguage.googleapis.com/v1beta/openai',
+      resolveEndpoint:
+        typeof utils.resolveChatCompletionsEndpoint === 'function'
+          ? utils.resolveChatCompletionsEndpoint
+          : (value, fallbackBaseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai') => {
+              const raw = String(value || '').trim() || fallbackBaseUrl;
+              if (!raw) return '';
+              const normalized = raw
+                .replace(/\/chat\/completions\/?$/i, '')
+                .replace(/\/+$/, '');
+              if (/\/openai$/i.test(normalized) || /\/v\d+(?:beta\d+)?$/i.test(normalized)) {
+                return `${normalized}/chat/completions`;
+              }
+              return `${normalized}/v1/chat/completions`;
+            },
+    };
+  })();
+
   // 最近提问记录（仅本机 localStorage，从现在开始记录，不回溯历史聊天内容）
   const QUESTION_RECENT_KEY = 'dpr_chat_recent_questions_v1';
   const QUESTION_PINNED_KEY = 'dpr_chat_pinned_questions_v1';
@@ -41,7 +64,7 @@ window.PrivateDiscussionChat = (function () {
     const models = [];
     chatList.forEach((item) => {
       if (!item || !item.models || !Array.isArray(item.models)) return;
-      const baseUrl = (item.baseUrl || '').trim();
+      const baseUrl = ((item.baseUrl || '').trim() || LLM_API_UTILS.defaultBaseUrl);
       const apiKey = (item.apiKey || '').trim();
       item.models.forEach((m) => {
         const name = (m || '').trim();
@@ -989,16 +1012,10 @@ window.PrivateDiscussionChat = (function () {
       return;
     }
 
-    const endpoint = (() => {
-      const raw = (modelEntry && modelEntry.baseUrl ? modelEntry.baseUrl : '').trim();
-      if (!raw) return '';
-      if (raw.includes('/chat/completions')) return raw;
-      const normalized = raw.replace(/\/+$/, '');
-      if (/\/v\d+$/i.test(normalized)) {
-        return `${normalized}/chat/completions`;
-      }
-      return `${normalized}/v1/chat/completions`;
-    })();
+    const endpoint = LLM_API_UTILS.resolveEndpoint(
+      modelEntry && modelEntry.baseUrl ? modelEntry.baseUrl : '',
+      LLM_API_UTILS.defaultBaseUrl,
+    );
 
     if (!endpoint) {
       aiAnswerDiv.textContent = '当前模型配置缺少 baseUrl。';
@@ -1137,14 +1154,6 @@ window.PrivateDiscussionChat = (function () {
             model,
             messages,
             stream: true,
-            // OpenAI 兼容：请求返回思考过程（reasoning_content / thinking）
-            reasoning: {
-              effort: 'medium',
-            },
-            // DeepSeek / 部分聚合网关要求通过 extra_body.return_reasoning 开启思考输出
-            extra_body: {
-              return_reasoning: true,
-            },
           }),
         });
       } finally {

@@ -12,6 +12,45 @@
   };
   const FORCE_GUEST_MODE = isForceGuestDomain(window && window.location && window.location.hostname);
 
+  const LLM_API_UTILS = (() => {
+    const utils = window.DPRLLMApiUtils || {};
+    const defaultBaseUrl =
+      utils.DEFAULT_GEMINI_OPENAI_BASE_URL ||
+      'https://generativelanguage.googleapis.com/v1beta/openai';
+    const defaultFlashModel =
+      utils.DEFAULT_GEMINI_FLASH_MODEL || 'gemini-3-flash-preview';
+    const defaultProModel =
+      utils.DEFAULT_GEMINI_PRO_MODEL || 'gemini-3.1-pro-preview';
+    const normalizeBaseUrl =
+      typeof utils.normalizeLlmBaseUrl === 'function'
+        ? utils.normalizeLlmBaseUrl
+        : (value, fallbackBaseUrl = defaultBaseUrl) => {
+            const raw = String(value || '').trim() || String(fallbackBaseUrl || '').trim();
+            if (!raw) return '';
+            return raw
+              .replace(/\/chat\/completions\/?$/i, '')
+              .replace(/\/+$/, '');
+          };
+    const resolveEndpoint =
+      typeof utils.resolveChatCompletionsEndpoint === 'function'
+        ? utils.resolveChatCompletionsEndpoint
+        : (value, fallbackBaseUrl = defaultBaseUrl) => {
+            const normalized = normalizeBaseUrl(value, fallbackBaseUrl);
+            if (!normalized) return '';
+            if (/\/openai$/i.test(normalized) || /\/v\d+(?:beta\d+)?$/i.test(normalized)) {
+              return `${normalized}/chat/completions`;
+            }
+            return `${normalized}/v1/chat/completions`;
+          };
+    return {
+      defaultBaseUrl,
+      defaultFlashModel,
+      defaultProModel,
+      normalizeBaseUrl,
+      resolveEndpoint,
+    };
+  })();
+
   const setAccessMode = (mode, detail) => {
     window.DPR_ACCESS_MODE = mode;
     try {
@@ -184,16 +223,16 @@
     return { owner: repoOwner, repo: repoName };
   }
 
-  // 将总结大模型 / 重排序模型的配置写入 GitHub Secrets
+  // 将当前 Gemini 配置写入 GitHub Secrets
   // 可选 progress 回调用于在 UI 中展示上传进度：progress(currentIndex, total, secretName)
   async function saveSummarizeSecretsToGithub(
     token,
-    summarisedApiKey,
-    summarisedModel,
+    geminiApiKey,
+    geminiBaseUrl,
+    summarizeModel,
     progress,
   ) {
     try {
-      // 等待 libsodium-wrappers 就绪（通过 CDN 注入全局 sodium）
       if (!window.sodium || !window.sodium.ready) {
         if (
           window.sodium &&
@@ -213,8 +252,6 @@
       }
 
       const { owner, repo } = await detectGithubRepoFromToken(token);
-
-      // 获取仓库 Public Key
       const pkRes = await fetch(
         `https://api.github.com/repos/${owner}/${repo}/actions/secrets/public-key`,
         {
@@ -246,32 +283,17 @@
         return sodium.to_base64(encBytes, sodium.base64_variants.ORIGINAL);
       };
 
-      // 简易配置下的约定：
-      // - Summarized_LLM_API_KEY：用户输入的柏拉图 API Key
-      // - Summarized_LLM_BASE_URL：默认 https://api.bltcy.ai/v1/chat/completions
-      // - Summarized_LLM_MODEL：用户选择的总结模型
-      // - BLT_API_KEY：写入后端流水线使用的 BLT_API_KEY（与 Summarized_LLM_API_KEY 相同）
-      // - Reranker_LLM_API_KEY：与 Summarized_LLM_API_KEY 相同
-      // - Reranker_LLM_BASE_URL：默认 https://api.bltcy.ai/v1/rerank
-      // - Reranker_LLM_MODEL：默认 qwen3-reranker-4b
-      const summarisedBaseUrl = 'https://api.bltcy.ai/v1/chat/completions';
-      const rerankerBaseUrl = 'https://api.bltcy.ai/v1/rerank';
-      const rerankerModel = 'qwen3-reranker-4b';
+      const normalizedBaseUrl = LLM_API_UTILS.normalizeBaseUrl(
+        geminiBaseUrl,
+        LLM_API_UTILS.defaultBaseUrl,
+      );
+      const secretNameApiKey = 'GEMINI_API_KEY';
+      const secretNameBaseUrl = 'GEMINI_BASE_URL';
+      const secretNameSummaryModel = 'GEMINI_SUMMARY_MODEL';
 
-      const secretNameSummKey = 'Summarized_LLM_API_KEY';
-      const secretNameSummUrl = 'Summarized_LLM_BASE_URL';
-      const secretNameSummModel = 'Summarized_LLM_MODEL';
-      const secretNameBltKey = 'BLT_API_KEY';
-      const secretNameRerankKey = 'Reranker_LLM_API_KEY';
-      const secretNameRerankUrl = 'Reranker_LLM_BASE_URL';
-      const secretNameRerankModel = 'Reranker_LLM_MODEL';
-
-      const encSummKey = encryptValue(summarisedApiKey);
-      const encSummUrl = encryptValue(summarisedBaseUrl);
-      const encSummModel = encryptValue(summarisedModel);
-      const encRerankKey = encryptValue(summarisedApiKey);
-      const encRerankUrl = encryptValue(rerankerBaseUrl);
-      const encRerankModel = encryptValue(rerankerModel);
+      const encApiKey = encryptValue(geminiApiKey);
+      const encBaseUrl = encryptValue(normalizedBaseUrl);
+      const encSummaryModel = encryptValue(summarizeModel);
 
       const putSecret = async (name, encrypted) => {
         const body = {
@@ -301,13 +323,9 @@
       };
 
       const secrets = [
-        { name: secretNameSummKey, value: encSummKey },
-        { name: secretNameSummUrl, value: encSummUrl },
-        { name: secretNameSummModel, value: encSummModel },
-        { name: secretNameBltKey, value: encSummKey },
-        { name: secretNameRerankKey, value: encRerankKey },
-        { name: secretNameRerankUrl, value: encRerankUrl },
-        { name: secretNameRerankModel, value: encRerankModel },
+        { name: secretNameApiKey, value: encApiKey },
+        { name: secretNameBaseUrl, value: encBaseUrl },
+        { name: secretNameSummaryModel, value: encSummaryModel },
       ];
 
       for (let i = 0; i < secrets.length; i += 1) {
@@ -329,7 +347,7 @@
     }
   }
 
-  function base64ToBytes(b64) {
+  function base64ToBytes  function base64ToBytes(b64) {
     const bin = atob(b64);
     const len = bin.length;
     const bytes = new Uint8Array(len);
@@ -657,7 +675,7 @@
         <div style="margin-bottom:10px; font-size:13px;">
           <label style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
             <input type="radio" name="secret-setup-mode" value="simple" checked />
-            <span><strong>简易配置（推荐）</strong>：填写 GitHub Token 与柏拉图 API Key，即可启用订阅与论文总结能力。</span>
+            <span><strong>简易配置（推荐）</strong>：填写 GitHub Token 与 Gemini API Key，即可启用订阅、总结与论文讨论能力。</span>
           </label>
           <label style="display:flex; align-items:center; gap:6px; color:#aaa;">
             <input type="radio" name="secret-setup-mode" value="advanced" disabled />
@@ -680,54 +698,49 @@
             需要具备 <code>repo</code> 和 <code>workflow</code> 权限。
           </div>
 
-          <div style="font-weight:500; margin-bottom:4px;">柏拉图（BLTCY）API Key（必填）</div>
+          <div style="font-weight:500; margin-bottom:4px;">Gemini API Key（必填）</div>
           <input
-            id="secret-setup-plato"
+            id="secret-setup-gemini-key"
             type="password"
             autocomplete="off"
-            placeholder="例如：sk-xxxx"
+            placeholder="例如：AIza..."
             style="width:100%; box-sizing:border-box; padding:6px 8px; margin-bottom:4px; font-size:13px;"
           />
-          <button id="secret-setup-plato-verify" type="button" class="secret-gate-btn secondary" style="margin-bottom:4px;">
-            验证柏拉图 API Key
+          <div style="font-weight:500; margin-bottom:4px;">Gemini Base URL（可修改）</div>
+          <input
+            id="secret-setup-gemini-base-url"
+            type="text"
+            autocomplete="off"
+            value="${LLM_API_UTILS.defaultBaseUrl}"
+            placeholder="${LLM_API_UTILS.defaultBaseUrl}"
+            style="width:100%; box-sizing:border-box; padding:6px 8px; margin-bottom:4px; font-size:13px;"
+          />
+          <button id="secret-setup-gemini-verify" type="button" class="secret-gate-btn secondary" style="margin-bottom:4px;">
+            验证 Gemini 配置
           </button>
-          <div id="secret-setup-plato-status" style="min-height:18px; font-size:12px; color:#999; margin-bottom:8px;">
-            将通过 <code>/v1/token/quota</code> 接口验证可用性。
+          <div id="secret-setup-gemini-status" style="min-height:18px; font-size:12px; color:#999; margin-bottom:8px;">
+            默认使用官方 OpenAI 兼容地址，也可以填写自建代理地址。
           </div>
 
           <div style="font-weight:500; margin-bottom:4px; display:flex; align-items:center; gap:4px;">
-            用于「总结整篇论文」的大模型（推荐选择 Gemini 3 Flash）
+            用于「总结整篇论文」的大模型
             <span class="secret-model-tip">!
               <span class="secret-model-tip-popup">
-                按照 Thinking（思考模式）的高负载场景估算：<br/>
+                当前默认保留两种 Gemini 模型：<br/>
                 <br/>
-                总结：15k 输入 + 4k 输出（含思考）<br/>
-                提问：16.1k 输入 + 2k 输出（含思考）<br/>
-                <br/>
-                模型 · 约价（单次）：<br/>
-                - Gemini 3 Flash：总结 ¥0.0195，提问 ¥0.0141（不到 2 分钱，100 篇论文约 2 元）<br/>
-                - DeepSeek V3：总结 ¥0.0294，提问 ¥0.0267（不到 3 分钱，长输出性价比极高）<br/>
-                - GPT-5：总结 ¥0.0588，提问 ¥0.0401（约 6 分钱）<br/>
-                - Gemini 3 Pro：总结 ¥0.0780，提问 ¥0.0562（约 8 分钱，一篇论文不到 1 毛钱）
+                - Gemini 3 Flash：更快，适合日常总结与检索辅助<br/>
+                - Gemini 3.1 Pro：推理更强，适合复杂论文分析
               </span>
             </span>
           </div>
           <div style="font-size:13px; margin-bottom:6px;">
             <label style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">
-              <input type="radio" name="secret-setup-summarize-model" value="gemini-3-flash-preview-thinking-1000" checked />
-              <span>Gemini 3 Flash（思考版，推荐）</span>
-            </label>
-            <label style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">
-              <input type="radio" name="secret-setup-summarize-model" value="deepseek-v3.2" />
-              <span>DeepSeek V3.2 · 深度思考</span>
-            </label>
-            <label style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">
-              <input type="radio" name="secret-setup-summarize-model" value="gpt-5-chat" />
-              <span>GPT-5 Chat · 通用高质量对话</span>
+              <input type="radio" name="secret-setup-summarize-model" value="${LLM_API_UTILS.defaultFlashModel}" checked />
+              <span>Gemini 3 Flash（默认）</span>
             </label>
             <label style="display:flex; align-items:center; gap:6px;">
-              <input type="radio" name="secret-setup-summarize-model" value="gemini-3-pro-preview" />
-              <span>Gemini 3 Pro（更强思考能力）</span>
+              <input type="radio" name="secret-setup-summarize-model" value="${LLM_API_UTILS.defaultProModel}" />
+              <span>Gemini 3.1 Pro（更强分析能力）</span>
             </label>
           </div>
         </div>
@@ -755,28 +768,66 @@
       const githubStatusEl = document.getElementById(
         'secret-setup-github-status',
       );
-      const platoInput = document.getElementById('secret-setup-plato');
-      const platoVerifyBtn = document.getElementById(
-        'secret-setup-plato-verify',
+      const geminiKeyInput = document.getElementById('secret-setup-gemini-key');
+      const geminiBaseUrlInput = document.getElementById(
+        'secret-setup-gemini-base-url',
       );
-      const platoStatusEl = document.getElementById('secret-setup-plato-status');
+      const geminiVerifyBtn = document.getElementById(
+        'secret-setup-gemini-verify',
+      );
+      const geminiStatusEl = document.getElementById('secret-setup-gemini-status');
       const errorEl = document.getElementById('secret-setup-error');
       const backBtn = document.getElementById('secret-setup-back');
       const closeBtn = document.getElementById('secret-setup-close');
       const genBtn = document.getElementById('secret-setup-generate');
 
-      if (!githubInput || !githubVerifyBtn || !platoInput || !platoVerifyBtn || !backBtn || !closeBtn || !genBtn) return;
+      if (
+        !githubInput ||
+        !githubVerifyBtn ||
+        !geminiKeyInput ||
+        !geminiBaseUrlInput ||
+        !geminiVerifyBtn ||
+        !backBtn ||
+        !closeBtn ||
+        !genBtn
+      ) return;
 
       let githubOk = false;
-      let platoOk = false;
+      let geminiOk = false;
+
+      const readSelectedModel = () => {
+        const modelInputs = document.querySelectorAll(
+          'input[name="secret-setup-summarize-model"]',
+        );
+        let selected = '';
+        modelInputs.forEach((el) => {
+          if (el.checked) selected = el.value;
+        });
+        return selected || LLM_API_UTILS.defaultFlashModel;
+      };
+
+      const readGeminiBaseUrl = () => LLM_API_UTILS.normalizeBaseUrl(
+        geminiBaseUrlInput.value,
+        LLM_API_UTILS.defaultBaseUrl,
+      );
+
+      const resetGeminiVerification = () => {
+        geminiOk = false;
+        if (geminiStatusEl) {
+          geminiStatusEl.textContent =
+            '默认使用官方 OpenAI 兼容地址，也可以填写自建代理地址。';
+          geminiStatusEl.style.color = '#999';
+        }
+      };
+
+      geminiKeyInput.addEventListener('input', resetGeminiVerification);
+      geminiBaseUrlInput.addEventListener('input', resetGeminiVerification);
 
       backBtn.addEventListener('click', () => {
-        // 返回第 1 步，重新设置密码
         renderInitStep1();
       });
 
       closeBtn.addEventListener('click', () => {
-        // 直接关闭弹窗
         hide();
       });
 
@@ -830,51 +881,74 @@
         }
       });
 
-      platoVerifyBtn.addEventListener('click', async () => {
-        const key = platoInput.value.trim();
+      geminiVerifyBtn.addEventListener('click', async () => {
+        const key = geminiKeyInput.value.trim();
+        const baseUrl = readGeminiBaseUrl();
+        const endpoint = LLM_API_UTILS.resolveEndpoint(baseUrl, LLM_API_UTILS.defaultBaseUrl);
         if (!key) {
-          platoStatusEl.textContent = '请先输入柏拉图 API Key。';
-          platoStatusEl.style.color = '#c00';
-          platoOk = false;
+          geminiStatusEl.textContent = '请先输入 Gemini API Key。';
+          geminiStatusEl.style.color = '#c00';
+          geminiOk = false;
           return;
         }
-        platoVerifyBtn.disabled = true;
-        platoStatusEl.textContent = '正在验证柏拉图 API Key...';
-        platoStatusEl.style.color = '#666';
+        if (!endpoint) {
+          geminiStatusEl.textContent = 'Gemini Base URL 无效。';
+          geminiStatusEl.style.color = '#c00';
+          geminiOk = false;
+          return;
+        }
+        geminiVerifyBtn.disabled = true;
+        geminiStatusEl.textContent = '正在验证 Gemini 配置...';
+        geminiStatusEl.style.color = '#666';
         try {
-          const resp = await fetch(
-            'https://api.bltcy.ai/v1/token/quota',
-            {
-              method: 'GET',
-              headers: {
-                Authorization: `Bearer ${key}`,
-              },
+          const resp = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${key}`,
             },
-          );
+            body: JSON.stringify({
+              model: LLM_API_UTILS.defaultFlashModel,
+              messages: [
+                {
+                  role: 'user',
+                  content: 'Reply with OK.',
+                },
+              ],
+              max_tokens: 8,
+            }),
+          });
           if (!resp.ok) {
-            throw new Error(`HTTP ${resp.status}`);
+            const txt = await resp.text().catch(() => '');
+            throw new Error(`HTTP ${resp.status}${txt ? ` - ${txt}` : ''}`);
           }
           const data = await resp.json().catch(() => null);
-          const quota =
-            data && typeof data.quota === 'number' ? data.quota : 0;
-          const used = -quota;
-          platoStatusEl.textContent = `✅ 验证成功：已用额度约 ${used.toFixed(
-            2,
-          )}`;
-          platoStatusEl.style.color = '#28a745';
-          platoOk = true;
+          const content =
+            data &&
+            data.choices &&
+            data.choices[0] &&
+            data.choices[0].message &&
+            typeof data.choices[0].message.content === 'string'
+              ? data.choices[0].message.content.trim()
+              : '';
+          const preview = content ? `，返回：${content.slice(0, 32)}` : '';
+          geminiStatusEl.textContent = `✅ 验证成功：${endpoint}${preview}`;
+          geminiStatusEl.style.color = '#28a745';
+          geminiOk = true;
+          geminiBaseUrlInput.value = baseUrl;
         } catch (e) {
-          platoStatusEl.textContent = `❌ 验证失败：${e.message || e}`;
-          platoStatusEl.style.color = '#c00';
-          platoOk = false;
+          geminiStatusEl.textContent = `❌ 验证失败：${e.message || e}`;
+          geminiStatusEl.style.color = '#c00';
+          geminiOk = false;
         } finally {
-          platoVerifyBtn.disabled = false;
+          geminiVerifyBtn.disabled = false;
         }
       });
 
       genBtn.addEventListener('click', async () => {
         const githubToken = githubInput.value.trim();
-        const platoKey = platoInput.value.trim();
+        const geminiKey = geminiKeyInput.value.trim();
+        const summarizedBaseUrl = readGeminiBaseUrl();
         const modeInputs = document.querySelectorAll(
           'input[name="secret-setup-mode"]',
         );
@@ -896,20 +970,14 @@
           }
           return;
         }
-        if (!platoKey || !platoOk) {
+        if (!geminiKey || !geminiOk) {
           if (errorEl) {
-            errorEl.textContent = '请先填写并通过验证柏拉图 API Key。';
+            errorEl.textContent = '请先填写并通过验证 Gemini 配置。';
             errorEl.style.color = '#c00';
           }
           return;
         }
-        const modelInputs = document.querySelectorAll(
-          'input[name="secret-setup-summarize-model"]',
-        );
-        let model = '';
-        modelInputs.forEach((el) => {
-          if (el.checked) model = el.value;
-        });
+        const model = readSelectedModel();
         if (!model) {
           if (errorEl) {
             errorEl.textContent = '请选择用于总结论文的大模型。';
@@ -919,34 +987,29 @@
         }
 
         const createdAt = new Date().toISOString();
-        const summarizedBaseUrl = 'https://api.bltcy.ai/v1/chat/completions';
-        const rerankerBaseUrl = 'https://api.bltcy.ai/v1/rerank';
-        const rerankerModel = 'qwen3-reranker-4b';
-
+        const rerankerModel = LLM_API_UTILS.defaultFlashModel;
         const plainConfig = {
           createdAt,
           github: {
             token: githubToken,
           },
           summarizedLLM: {
-            apiKey: platoKey,
+            apiKey: geminiKey,
             baseUrl: summarizedBaseUrl,
             model,
           },
           rerankerLLM: {
-            apiKey: platoKey,
-            baseUrl: rerankerBaseUrl,
+            apiKey: geminiKey,
+            baseUrl: summarizedBaseUrl,
             model: rerankerModel,
           },
           chatLLMs: [
             {
-              apiKey: platoKey,
+              apiKey: geminiKey,
               baseUrl: summarizedBaseUrl,
               models: [
-                'gemini-3-flash-preview-thinking-1000',
-                'deepseek-v3.2',
-                'gpt-5-chat',
-                'gemini-3-pro-preview-thinking-1000',
+                LLM_API_UTILS.defaultFlashModel,
+                LLM_API_UTILS.defaultProModel,
               ],
             },
           ],
@@ -959,10 +1022,10 @@
           }
           genBtn.disabled = true;
 
-          // 1) 将总结大模型相关配置写入 GitHub Secrets（失败则中止后续流程）
           const secretsOk = await saveSummarizeSecretsToGithub(
             githubToken,
-            platoKey,
+            geminiKey,
+            summarizedBaseUrl,
             model,
             (current, total, secretName) => {
               if (!errorEl) return;
@@ -977,7 +1040,6 @@
             return;
           }
 
-          // 2) 生成本地 secret.private 备份
           if (errorEl) {
             errorEl.textContent = 'GitHub Secrets 上传完成，正在生成加密配置 secret.private...';
             errorEl.style.color = '#666';
@@ -998,7 +1060,6 @@
             URL.revokeObjectURL(url);
           }, 0);
 
-          // 3) 将 secret.private 提交到 GitHub 仓库根目录（最好由向导自动推送一份）
           if (errorEl) {
             errorEl.textContent = '正在将 secret.private 推送到 GitHub 仓库根目录...';
             errorEl.style.color = '#666';
@@ -1015,12 +1076,10 @@
 
           hide();
 
-          // 第三步：自动打开后台订阅面板，帮助用户完成 GitHub 订阅配置
           try {
             if (window.SubscriptionsManager && window.SubscriptionsManager.openOverlay) {
               window.SubscriptionsManager.openOverlay();
             } else {
-              // 回退：使用与左下角 📚 按钮相同的事件机制唤起订阅面板
               var ensureEvent = new CustomEvent('ensure-arxiv-ui');
               document.dispatchEvent(ensureEvent);
               setTimeout(function () {
@@ -1053,7 +1112,7 @@
       });
     };
 
-    // 初始化向导：第 1 步（设置密码）
+    // 初始化向导：第 1 步（设置密码）    // 初始化向导：第 1 步（设置密码）
     const renderInitStep1 = () => {
       modal.innerHTML = `
         <h2 style="margin-top:0;">🛡️ 新配置指引 · 第一步</h2>
